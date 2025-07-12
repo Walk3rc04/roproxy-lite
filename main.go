@@ -10,8 +10,8 @@ import (
 	"strings"
 )
 
-var timeout, _ = strconv.Atoi(os.Getenv("TIMEOUT"))
-var retries, _ = strconv.Atoi(os.Getenv("RETRIES"))
+var timeout = getEnvInt("TIMEOUT", 10)
+var retries = getEnvInt("RETRIES", 3)
 var port = os.Getenv("PORT")
 var logSlowMs = getEnvInt("LOG_SLOW_MS", 300)
 var logErrorsOnly = os.Getenv("LOG_ERRORS_ONLY") == "true"
@@ -119,7 +119,7 @@ func makeRequest(ctx *fasthttp.RequestCtx, attempt int) *fasthttp.Response {
 	defer fasthttp.ReleaseRequest(req)
 	req.Header.SetMethod(string(ctx.Method()))
 	url := strings.SplitN(string(ctx.Request.Header.RequestURI())[1:], "/", 2)
-	req.SetRequestURI("https://" + url[0] + ".roblox.com/" + url[1])
+	req.SetRequestURI("https://" + url[0] + "/" + url[1])
 	req.SetBody(ctx.Request.Body())
 	ctx.Request.Header.VisitAll(func (key, value []byte) {
 		req.Header.Set(string(key), string(value))
