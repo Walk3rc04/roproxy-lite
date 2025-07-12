@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"log"
-	"net"
 	"time"
 	"os"
 	"github.com/valyala/fasthttp"
