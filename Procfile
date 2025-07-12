@@ -1,1 +1,1 @@
-web: ./roproxy
+web: roproxy
