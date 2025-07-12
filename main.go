@@ -1,7 +1,9 @@
 package main
 
 import (
+	"encoding/json"
 	"log"
+	"net"
 	"time"
 	"os"
 	"github.com/valyala/fasthttp"
@@ -12,21 +14,72 @@ import (
 var timeout, _ = strconv.Atoi(os.Getenv("TIMEOUT"))
 var retries, _ = strconv.Atoi(os.Getenv("RETRIES"))
 var port = os.Getenv("PORT")
+var logSlowMs = getEnvInt("LOG_SLOW_MS", 300)
+var logErrorsOnly = os.Getenv("LOG_ERRORS_ONLY") == "true"
+
+func getEnvInt(key string, fallback int) int {
+	val, err := strconv.Atoi(os.Getenv(key))
+	if err != nil {
+		return fallback
+	}
+	return val
+}
 
 var client *fasthttp.Client
 
 func main() {
-	h := requestHandler
+	h := func(ctx *fasthttp.RequestCtx) {
+		start := time.Now()
+		requestHandler(ctx)
+
+		// Decide whether to log
+		status := ctx.Response.StatusCode()
+		durMs  := time.Since(start).Milliseconds()
+
+		if logErrorsOnly && status < 400 && durMs < int64(logSlowMs) {
+			return // skip normal fast 2xx / 3xx responses
+		}
+		if durMs < int64(logSlowMs) && status < 400 {
+			return // nothing “interesting”
+		}
+
+		jlog(map[string]any{
+			"at":       "request_end",
+			"method":   string(ctx.Method()),
+			"uri":      string(ctx.RequestURI()),
+			"status":   status,
+			"duration": durMs,
+			"remote":   ctx.RemoteIP().String(),
+		})
+	}
 	
 	client = &fasthttp.Client{
 		ReadTimeout: time.Duration(timeout) * time.Second,
 		MaxIdleConnDuration: 60 * time.Second,
 	}
+	
+    jlog(map[string]any{
+        "at":      "startup",
+        "port":    port,
+        "timeout": timeout,
+        "retries": retries,
+    })
 
 	if err := fasthttp.ListenAndServe(":" + port, h); err != nil {
 		log.Fatalf("Error in ListenAndServe: %s", err)
 	}
 }
+
+// Error logs
+func jlog(fields map[string]any) {
+    b, _ := json.Marshal(fields)
+    log.Println(string(b))
+}
+
+func init() {
+    log.SetFlags(log.LstdFlags | log.LUTC | log.Lshortfile)
+}
+
 
 func requestHandler(ctx *fasthttp.RequestCtx) {
 	val, ok := os.LookupEnv("KEY")
@@ -44,7 +97,6 @@ func requestHandler(ctx *fasthttp.RequestCtx) {
 	}
 
 	response := makeRequest(ctx, 1)
-
 	defer fasthttp.ReleaseResponse(response)
 
 	body := response.Body()
@@ -80,9 +132,16 @@ func makeRequest(ctx *fasthttp.RequestCtx, attempt int) *fasthttp.Response {
 	err := client.Do(req, resp)
 
     if err != nil {
+		jlog(map[string]any{
+			"at":       "retry",
+			"attempt":  attempt,
+			"max":      retries,
+			"method":   string(ctx.Method()),
+			"uri":      string(ctx.RequestURI()),
+			"error":    err.Error(),
+		})
 		fasthttp.ReleaseResponse(resp)
-        return makeRequest(ctx, attempt + 1)
-    } else {
-		return resp
+		return makeRequest(ctx, attempt+1)
 	}
+	return resp
 }
