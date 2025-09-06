@@ -9,7 +9,7 @@
         },
         "TIMEOUT": {
             "description": "The number of seconds before a request times out and is retried.",
-            "value": "5"
+            "value": "15"
         },
         "RETRIES": {
             "description": "The maximum number of times to attempt a request. Minimum: 1",

@@ -3,15 +3,16 @@ package main
 import (
 	"encoding/json"
 	"log"
-	"time"
 	"os"
-	"github.com/valyala/fasthttp"
 	"strconv"
 	"strings"
+	"time"
+
+	"github.com/valyala/fasthttp"
 )
 
-var timeout = getEnvInt("TIMEOUT", 10)
-var retries = getEnvInt("RETRIES", 3)
+var timeout = getEnvInt("TIMEOUT", 15)
+var retries = getEnvInt("RETRIES", 5)
 var port = os.Getenv("PORT")
 var logSlowMs = getEnvInt("LOG_SLOW_MS", 300)
 var logErrorsOnly = os.Getenv("LOG_ERRORS_ONLY") == "true"
@@ -31,15 +32,14 @@ func main() {
 		start := time.Now()
 		requestHandler(ctx)
 
-		// Decide whether to log
 		status := ctx.Response.StatusCode()
-		durMs  := time.Since(start).Milliseconds()
+		durMs := time.Since(start).Milliseconds()
 
 		if logErrorsOnly && status < 400 && durMs < int64(logSlowMs) {
 			return // skip normal fast 2xx / 3xx responses
 		}
 		if durMs < int64(logSlowMs) && status < 400 {
-			return // nothing “interesting”
+			return
 		}
 
 		jlog(map[string]any{
@@ -51,34 +51,33 @@ func main() {
 			"remote":   ctx.RemoteIP().String(),
 		})
 	}
-	
-	client = &fasthttp.Client{
-		ReadTimeout: time.Duration(timeout) * time.Second,
-		MaxIdleConnDuration: 60 * time.Second,
-	}
-	
-    jlog(map[string]any{
-        "at":      "startup",
-        "port":    port,
-        "timeout": timeout,
-        "retries": retries,
-    })
 
-	if err := fasthttp.ListenAndServe(":" + port, h); err != nil {
+	client = &fasthttp.Client{
+		ReadTimeout:         time.Duration(timeout) * time.Second,
+		MaxIdleConnDuration: 60 * time.Second,
+		MaxConnsPerHost:     16,
+	}
+
+	jlog(map[string]any{
+		"at":      "startup",
+		"port":    port,
+		"timeout": timeout,
+		"retries": retries,
+	})
+
+	if err := fasthttp.ListenAndServe(":"+port, h); err != nil {
 		log.Fatalf("Error in ListenAndServe: %s", err)
 	}
 }
 
-// Error logs
 func jlog(fields map[string]any) {
-    b, _ := json.Marshal(fields)
-    log.Println(string(b))
+	b, _ := json.Marshal(fields)
+	log.Println(string(b))
 }
 
 func init() {
-    log.SetFlags(log.LstdFlags | log.LUTC | log.Lshortfile)
+	log.SetFlags(log.LstdFlags | log.LUTC | log.Lshortfile)
 }
-
 
 func requestHandler(ctx *fasthttp.RequestCtx) {
 	val, ok := os.LookupEnv("KEY")
@@ -98,48 +97,77 @@ func requestHandler(ctx *fasthttp.RequestCtx) {
 	response := makeRequest(ctx, 1)
 	defer fasthttp.ReleaseResponse(response)
 
-	body := response.Body()
-	ctx.SetBody(body)
 	ctx.SetStatusCode(response.StatusCode())
-	response.Header.VisitAll(func (key, value []byte) {
+	response.Header.VisitAll(func(key, value []byte) {
 		ctx.Response.Header.Set(string(key), string(value))
 	})
+
+	ctx.Response.Header.Set("X-Proxy-Upstream-Status", strconv.Itoa(response.StatusCode()))
+	ctx.Response.Header.Set("Via", "roproxy-lite")
+
+	ctx.SetBody(response.Body())
 }
 
 func makeRequest(ctx *fasthttp.RequestCtx, attempt int) *fasthttp.Response {
 	if attempt > retries {
-		resp := fasthttp.AcquireResponse()
-		resp.SetBody([]byte("Proxy failed to connect. Please try again."))
-		resp.SetStatusCode(500)
-
-		return resp
+		r := fasthttp.AcquireResponse()
+		r.SetStatusCode(504)
+		r.SetBodyString("upstream timeout")
+		return r
 	}
+
+	raw := string(ctx.RequestURI())
+	parts := strings.SplitN(raw[1:], "/", 2)
+	if len(parts) < 2 {
+		r := fasthttp.AcquireResponse()
+		r.SetStatusCode(400)
+		r.SetBodyString("URL format invalid.")
+		return r
+	}
+	upHost, upPath := parts[0], parts[1]
 
 	req := fasthttp.AcquireRequest()
 	defer fasthttp.ReleaseRequest(req)
-	req.Header.SetMethod(string(ctx.Method()))
-	url := strings.SplitN(string(ctx.Request.Header.RequestURI())[1:], "/", 2)
-	req.SetRequestURI("https://" + url[0] + "/" + url[1])
-	req.SetBody(ctx.Request.Body())
-	ctx.Request.Header.VisitAll(func (key, value []byte) {
-		req.Header.Set(string(key), string(value))
-	})
+
+	req.Header.SetMethodBytes(ctx.Method())
+	req.SetRequestURI("https://" + upHost + "/" + upPath)
+	req.Header.SetHost(upHost)
 	req.Header.Set("User-Agent", "RoProxy")
 	req.Header.Del("Roblox-Id")
+	req.SetBody(ctx.Request.Body())
+
+	ctx.Request.Header.VisitAll(func(k, v []byte) {
+		switch strings.ToLower(string(k)) {
+		case "host", "connection", "proxy-connection", "keep-alive",
+			"transfer-encoding", "upgrade", "te", "content-length",
+			"accept-encoding", "proxykey", "x-request-id":
+			return
+		default:
+			req.Header.SetBytesKV(k, v)
+		}
+	})
+
 	resp := fasthttp.AcquireResponse()
-
-	err := client.Do(req, resp)
-
-    if err != nil {
-		jlog(map[string]any{
-			"at":       "retry",
-			"attempt":  attempt,
-			"max":      retries,
-			"method":   string(ctx.Method()),
-			"uri":      string(ctx.RequestURI()),
-			"error":    err.Error(),
-		})
+	if err := client.Do(req, resp); err != nil {
+		jlog(map[string]any{"at": "retry_err", "attempt": attempt, "uri": raw, "err": err.Error()})
 		fasthttp.ReleaseResponse(resp)
+		time.Sleep(time.Duration(100*attempt) * time.Millisecond)
+		return makeRequest(ctx, attempt+1)
+	}
+
+	sc := resp.StatusCode()
+	if sc == 429 {
+		if ra := resp.Header.Peek("Retry-After"); len(ra) > 0 {
+			if s, _ := strconv.Atoi(string(ra)); s > 0 {
+				time.Sleep(time.Duration(s)*time.Second + 100*time.Millisecond)
+			}
+		}
+		return resp
+	}
+	if sc >= 500 && sc <= 599 {
+		jlog(map[string]any{"at": "retry_5xx", "attempt": attempt, "status": sc, "uri": raw})
+		time.Sleep(time.Duration(100*attempt) * time.Millisecond)
+		resp.Reset()
 		return makeRequest(ctx, attempt+1)
 	}
 	return resp
