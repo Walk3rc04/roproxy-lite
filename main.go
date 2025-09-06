@@ -125,6 +125,7 @@ func makeRequest(ctx *fasthttp.RequestCtx, attempt int) *fasthttp.Response {
 		return r
 	}
 	upHost, upPath := parts[0], parts[1]
+	upPath = strings.TrimPrefix(upPath, "/")
 
 	req := fasthttp.AcquireRequest()
 	defer fasthttp.ReleaseRequest(req)
